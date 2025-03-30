@@ -1,0 +1,41 @@
+# Telegram API credentials
+phone_number: "+380500149151"
+api_id: 23283691
+api_hash: "451488329cb2a137d81ad62cea301838"
+
+# ID цільового каналу
+target_channel_id: 2582554569
+
+# Налаштування каналів з індивідуальними фільтрами
+channels:
+  - channel_id: 2005000929 # Внутри графика с Джимми
+    keywords:
+      - "шорт"
+      - "лонг"
+      - "снижения"
+      - "откупаю"
+      - "скачок"
+
+  - channel_id: 2136132579 # VIP марафон | Даниэль
+    keywords:
+      - "заполняю"
+      - "входим"
+      - "long"
+      - "short"
+
+  - channel_id: 2233791601 # Тест - виправлений ID
+    keywords: [] # Пересилати всі повідомлення
+
+  - channel_id: 1195973120 # Crypto Alliance | Мартин
+    keywords:
+      - "заходим"
+      - "long"
+      - "short"
+
+  - channel_id: 1939888914 # 2Trade - Kirill Sobolev
+    keywords:
+      - "Внутри дня"
+
+  - channel_id: 2160678345 # KostyaKogan
+    keywords:
+      - "Открыл"
