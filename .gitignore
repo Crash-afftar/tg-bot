@@ -1,0 +1,23 @@
+# Файли сесій Telethon
+*.session
+*.session-journal
+
+# Логи
+*.log
+
+# Кеш Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Оптимізовані файли
+optimized_channels.json
+
+# Віртуальне середовище
+venv/
+env/
+ENV/
+
+# Різне
+.DS_Store
+Thumbs.db 
