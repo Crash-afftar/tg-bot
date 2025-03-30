@@ -16,6 +16,7 @@ from telethon.errors import (
 )
 from telethon.tl.types import PeerChannel
 from filters import filter_message
+from telethon.events import NewMessage
 
 # Перевірка на одночасний запуск
 def is_process_running():
@@ -103,6 +104,9 @@ class TelegramMonitor:
         self.running = True
         self.connection_retries = 0
         self.max_connection_retries = 5
+        self.message_handlers = []
+        self.last_message_ids = {}  # Зберігає останні ID повідомлень для кожного каналу
+        self.processed_messages = set()  # Множина IDs повідомлень, які вже були оброблені
     
     async def load_config(self):
         """Завантаження конфігурації з файлу."""
@@ -144,20 +148,23 @@ class TelegramMonitor:
             logging.error("Немає конфігурації!")
             return
         
-        # Використовуємо унікальне ім'я сесії
+        # Використовуємо унікальне ім'я сесії, що включає hostname
         session_name = f"telegram_monitor_{socket.gethostname()}"
         logging.info(f"Використовуємо сесію: {session_name}")
         
-        # Створюємо клієнт з МАКСИМАЛЬНО мінімальними параметрами
+        # Створюємо клієнт з оптимізованими налаштуваннями згідно документації Telegram API
         self.client = TelegramClient(
             session_name, 
             self.config['api_id'], 
             self.config['api_hash'],
+            # Налаштування для оптимізованого отримання оновлень
+            # catch_up=True - включає механізм різницевих оновлень
+            # sequential_updates=False - дозволяє паралельну обробку оновлень
+            catch_up=True,
+            sequential_updates=False,
+            request_retries=3,
+            auto_reconnect=True,
             base_logger=logging.getLogger('telethon'),
-            receive_updates=False,  # Вимикаємо оновлення
-            auto_reconnect=False,   # Вимикаємо автоматичне перепідключення
-            retry_delay=10,
-            connection_retries=3,
             flood_sleep_threshold=60
         )
         
@@ -172,167 +179,303 @@ class TelegramMonitor:
             
             logging.info("Telegram клієнт підключено")
             
-            # Запускаємо завдання
-            self.running = True
-            polling_task = asyncio.create_task(self.manual_polling())
-            config_task = asyncio.create_task(self.check_config_updates())
+            # Оновлюємо обробники подій
+            await self.update_handlers()
+            
+            # Запускаємо перевірку оновлень конфігурації
+            asyncio.create_task(self.check_config_updates())
+            
+            # Запускаємо оптимізацію кешу діалогів для зменшення навантаження
+            asyncio.create_task(self.optimize_dialogs_cache())
+            
+            # Запускаємо активне опитування каналів для швидшого отримання повідомлень
+            asyncio.create_task(self.active_polling())
             
             logging.info("Telegram монітор запущено")
             
-            # Чекаємо завершення завдань
             try:
-                await asyncio.gather(polling_task, config_task)
-            except asyncio.CancelledError:
-                logging.info("Завдання скасовано")
+                # Очікуємо на завершення роботи клієнта
+                await self.client.run_until_disconnected()
             except Exception as e:
-                logging.error(f"Помилка у головному циклі: {e}", exc_info=True)
-            
+                logging.error(f"Помилка в основному циклі: {e}", exc_info=True)
+                # Спроба перезапуску клієнта в разі помилки
+                logging.info("Спроба перезапуску через 10 секунд...")
+                await asyncio.sleep(10)
+                return await self.start_client()
         except Exception as e:
             logging.error(f"Помилка запуску клієнта: {e}", exc_info=True)
-            # Спроба перезапуску клієнта
-            self.connection_retries += 1
-            if self.connection_retries < self.max_connection_retries:
-                retry_delay = 10 * (2 ** (self.connection_retries - 1))  # Експоненційна затримка
-                logging.info(f"Спроба перезапуску клієнта через {retry_delay} секунд... (спроба {self.connection_retries}/{self.max_connection_retries})")
-                await asyncio.sleep(retry_delay)
-                return await self.start_client()
-            else:
-                logging.critical(f"Досягнуто максимальної кількості спроб підключення ({self.max_connection_retries}). Завершення роботи.")
-                self.running = False
-        finally:
-            # Закриваємо з'єднання при виході
-            if self.client and self.client.is_connected():
-                await self.client.disconnect()
-                logging.info("З'єднання з Telegram закрито")
-            
-    async def manual_polling(self):
-        """Власний цикл моніторингу каналів."""
-        # Зберігаємо останні повідомлення
-        last_message_ids = {}
+            # Спроба перезапуску у випадку помилки
+            logging.info("Спроба перезапуску через 30 секунд...")
+            await asyncio.sleep(30)
+            return await self.start_client()
+    
+    async def update_handlers(self):
+        """Оновлює обробники подій відповідно до поточної конфігурації."""
+        # Видаляємо старі обробники
+        for handler in self.message_handlers:
+            self.client.remove_event_handler(handler)
         
-        # Інтервал перевірки каналів (секунди)
-        # Збільшення інтервалу зменшує навантаження на сервер і ризик блокування
-        poll_interval = 15
+        self.message_handlers = []
         
-        logging.info(f"Запуск власного циклу моніторингу з інтервалом {poll_interval} секунд")
+        # Отримуємо список ID каналів для моніторингу
+        channel_ids = [int(channel_config['channel_id']) for channel_config in self.config.get('channels', [])]
+        logging.info(f"Оновлено моніторинг каналів: {channel_ids}")
         
+        # Виводимо більше інформації про канали
+        for channel_config in self.config.get('channels', []):
+            channel_id = int(channel_config['channel_id'])
+            try:
+                entity = await self.client.get_entity(PeerChannel(channel_id))
+                logging.info(f"Знайдено канал: {entity.title} (ID: {channel_id})")
+            except Exception as e:
+                logging.warning(f"Не вдалося отримати інформацію про канал {channel_id}: {e}")
+        
+        # Виводимо інформацію про цільовий канал
+        target_channel_id = self.config.get('target_channel_id')
         try:
-            while self.running:
-                try:
-                    # Перевіряємо підключення
-                    if not self.client.is_connected():
-                        logging.warning("Втрачено з'єднання з Telegram. Перепідключення...")
-                        await self.client.connect()
-                        if not self.client.is_connected():
-                            logging.error("Не вдалося перепідключитися. Чекаємо 30 секунд...")
-                            await asyncio.sleep(30)
-                            continue
+            target_entity = await self.client.get_entity(PeerChannel(int(target_channel_id)))
+            logging.info(f"Цільовий канал: {target_entity.title} (ID: {target_channel_id})")
+        except Exception as e:
+            logging.error(f"Не вдалося отримати інформацію про цільовий канал {target_channel_id}: {e}")
+        
+        # Реєструємо новий обробник для визначених каналів
+        # Важливо: chats=channel_ids вказує Telegram, які канали нас цікавлять
+        @self.client.on(NewMessage(chats=channel_ids))
+        async def handle_new_message(event):
+            try:
+                if not event.chat:
+                    return
+                
+                # Перевіряємо, чи це повідомлення вже було оброблено
+                msg_id = f"{event.chat.id}_{event.message.id}"
+                if msg_id in self.processed_messages:
+                    logging.debug(f"Повідомлення {msg_id} вже було оброблено раніше, пропускаємо")
+                    return
+                
+                # Додаємо повідомлення до списку оброблених
+                self.processed_messages.add(msg_id)
+                
+                # Обмежуємо розмір множини оброблених повідомлень (зберігаємо останні 1000)
+                if len(self.processed_messages) > 1000:
+                    # Видаляємо старі записи
+                    excess = len(self.processed_messages) - 1000
+                    self.processed_messages = set(list(self.processed_messages)[excess:])
+                
+                logging.info(f"Отримано повідомлення з каналу: {event.chat.title} (ID: {event.chat.id})")
+                
+                # Оновлюємо останній ID повідомлення для каналу
+                self.last_message_ids[event.chat.id] = event.message.id
+                
+                # Обробка повідомлення
+                message_text = event.message.text or ''
+                logging.info(f"Текст повідомлення: {message_text}")
+                
+                # Знаходимо налаштування для цього каналу
+                current_channel_config = None
+                for channel_config in self.config.get('channels', []):
+                    if int(channel_config['channel_id']) == event.chat.id:
+                        current_channel_config = channel_config
+                        keywords = current_channel_config.get('keywords', [])
+                        logging.info(f"Знайдено конфігурацію для каналу {event.chat.id}. Ключові слова: {keywords}")
+                        break
+                
+                if not current_channel_config:
+                    logging.warning(f"Не знайдено конфігурацію для каналу {event.chat.id}")
+                    return
+                
+                # Перевірка фільтрів за ключовими словами
+                keywords = current_channel_config.get('keywords', [])
+                should_forward = not keywords or filter_message(message_text, keywords)
+                logging.info(f"Перевірка фільтрації: should_forward={should_forward}, keywords={keywords}")
+                
+                if should_forward:
+                    try:
+                        # Отримання цільового каналу з загальної конфігурації
+                        target_channel_id = self.config.get('target_channel_id')
+                        
+                        if target_channel_id:
+                            # Додаємо підпис з назвою каналу-джерела
+                            channel_signature = f"**Канал: {event.chat.title}**\n\n"
+                            full_message = channel_signature + message_text
+                            
+                            # Використовуємо ID безпосередньо
+                            await self.client.send_message(PeerChannel(int(target_channel_id)), full_message)
+                            logging.info(f"Переслано повідомлення з {event.chat.title} (ID: {event.chat.id}) до {target_channel_id}")
+                        else:
+                            logging.error("Не вказано ID цільового каналу в конфігурації")
                     
+                    except Exception as e:
+                        logging.error(f"Помилка пересилання: {e}")
+                else:
+                    logging.info(f"Повідомлення не відповідає фільтрам, пересилання скасовано")
+            except Exception as e:
+                logging.error(f"Помилка обробки повідомлення: {e}", exc_info=True)
+                # Продовжуємо роботу бота, незважаючи на помилку в обробці одного повідомлення
+        
+        # Зберігаємо обробник у списку для можливості видалення в майбутньому
+        self.message_handlers.append(handle_new_message)
+    
+    async def optimize_dialogs_cache(self):
+        """Періодично оптимізує кеш діалогів для зменшення навантаження"""
+        try:
+            while True:
+                try:
+                    # Отримуємо список ID каналів для моніторингу
+                    channel_ids = [int(channel_config['channel_id']) for channel_config in self.config.get('channels', [])]
+                    
+                    # Оптимізуємо кеш діалогів
+                    from telethon.tl.functions.messages import GetDialogFiltersRequest
+                    await self.client(GetDialogFiltersRequest())
+                    
+                    # Оновлюємо кеш тільки для потрібних каналів
+                    for channel_id in channel_ids:
+                        try:
+                            # Отримуємо entity каналу і кешуємо його
+                            entity = await self.client.get_entity(PeerChannel(channel_id))
+                            logging.debug(f"Оновлено кеш для каналу: {entity.title} (ID: {channel_id})")
+                        except Exception as e:
+                            logging.debug(f"Помилка при оновленні кешу для каналу {channel_id}: {e}")
+                    
+                    # Викликаємо catch_up для отримання останніх оновлень
+                    await self.client.catch_up()
+                    logging.debug("Кеш діалогів оптимізовано")
+                    
+                except Exception as e:
+                    logging.error(f"Помилка при оптимізації кешу діалогів: {e}", exc_info=True)
+                
+                # Оптимізуємо кеш кожні 5 хвилин
+                await asyncio.sleep(300)
+        except asyncio.CancelledError:
+            logging.info("Завдання оптимізації кешу скасовано")
+        except Exception as e:
+            logging.error(f"Критична помилка в циклі оптимізації кешу: {e}", exc_info=True)
+
+    async def active_polling(self):
+        """Активне опитування каналів для швидшого отримання повідомлень"""
+        try:
+            # Інтервал опитування в секундах
+            poll_interval = 30  # 30 секунд
+            
+            logging.info(f"Запуск активного опитування каналів (інтервал: {poll_interval} секунд)")
+            
+            while True:
+                try:
                     # Отримуємо список ID каналів для моніторингу
                     channel_ids = [int(channel_config['channel_id']) for channel_config in self.config.get('channels', [])]
                     
                     if not channel_ids:
-                        logging.warning("Не знайдено жодного каналу для моніторингу!")
+                        logging.warning("Не знайдено жодного каналу для опитування")
                         await asyncio.sleep(poll_interval)
                         continue
                     
                     for channel_id in channel_ids:
                         try:
                             # Отримуємо entity каналу 
-                            channel_entity = await self.client.get_entity(PeerChannel(channel_id))
-                            channel_title = channel_entity.title
+                            entity = await self.client.get_entity(PeerChannel(channel_id))
                             
-                            # Отримуємо останні повідомлення
-                            messages = await self.client.get_messages(channel_entity, limit=5)
+                            # Запитуємо останні 10 повідомлень
+                            messages = await self.client.get_messages(entity, limit=10)
                             
                             if not messages:
-                                # logging.debug(f"Нема повідомлень у каналі {channel_title}")
                                 continue
                             
-                            # Ініціалізуємо останній ID, якщо потрібно
-                            if channel_id not in last_message_ids:
-                                last_message_ids[channel_id] = messages[0].id
-                                logging.info(f"Встановлено початковий ID {last_message_ids[channel_id]} для каналу {channel_title}")
+                            # Перевіряємо наявність каналу в словнику останніх повідомлень
+                            if channel_id not in self.last_message_ids:
+                                # Перший запуск - запам'ятовуємо ID останнього повідомлення
+                                self.last_message_ids[channel_id] = messages[0].id
+                                logging.debug(f"Ініціалізовано ID останнього повідомлення для каналу {entity.title} (ID: {channel_id}): {self.last_message_ids[channel_id]}")
                                 continue
                             
-                            # Перевіряємо нові повідомлення
-                            last_id = last_message_ids[channel_id]
+                            # Шукаємо нові повідомлення (з ID більшим ніж збережений)
+                            last_id = self.last_message_ids[channel_id]
                             new_messages = [msg for msg in messages if msg.id > last_id]
                             
-                            if new_messages:
-                                logging.info(f"Знайдено {len(new_messages)} нових повідомлень у каналі {channel_title}")
-                                
-                                # Сортуємо повідомлення за ID (від старого до нового)
-                                new_messages.sort(key=lambda msg: msg.id)
-                                
-                                # Знаходимо налаштування цього каналу
-                                channel_config = next(
-                                    (cfg for cfg in self.config.get('channels', []) 
-                                     if int(cfg['channel_id']) == channel_id), 
-                                    None
-                                )
-                                
-                                if not channel_config:
-                                    logging.warning(f"Не знайдено конфігурацію для каналу {channel_id}")
+                            if not new_messages:
+                                continue
+                            
+                            # Сортуємо повідомлення за ID (від старого до нового)
+                            new_messages.sort(key=lambda msg: msg.id)
+                            
+                            logging.info(f"Знайдено {len(new_messages)} нових повідомлень у каналі {entity.title} (ID: {channel_id}) через активне опитування")
+                            
+                            # Обробляємо кожне нове повідомлення
+                            for message in new_messages:
+                                # Перевіряємо, чи це повідомлення вже було оброблено
+                                msg_id = f"{channel_id}_{message.id}"
+                                if msg_id in self.processed_messages:
+                                    logging.debug(f"Повідомлення {msg_id} вже було оброблено раніше, пропускаємо")
                                     continue
                                 
-                                keywords = channel_config.get('keywords', [])
+                                # Додаємо повідомлення до списку оброблених
+                                self.processed_messages.add(msg_id)
                                 
-                                # Обробляємо кожне нове повідомлення
-                                for message in new_messages:
-                                    message_text = message.text or ''
-                                    logging.info(f"Отримано нове повідомлення з каналу: {channel_title}")
-                                    logging.info(f"Текст повідомлення: {message_text[:100]}...")
-                                    
-                                    # Застосовуємо фільтр за ключовими словами
-                                    should_forward = not keywords or filter_message(message_text, keywords)
-                                    
-                                    if should_forward:
+                                # Обмежуємо розмір множини оброблених повідомлень (зберігаємо останні 1000)
+                                if len(self.processed_messages) > 1000:
+                                    # Видаляємо старі записи
+                                    excess = len(self.processed_messages) - 1000
+                                    self.processed_messages = set(list(self.processed_messages)[excess:])
+                                
+                                # Оновлюємо ID останнього повідомлення
+                                self.last_message_ids[channel_id] = message.id
+                                
+                                # Обробка повідомлення
+                                message_text = message.text or ''
+                                
+                                # Знаходимо налаштування для цього каналу
+                                current_channel_config = None
+                                for channel_config in self.config.get('channels', []):
+                                    if int(channel_config['channel_id']) == channel_id:
+                                        current_channel_config = channel_config
+                                        break
+                                
+                                if not current_channel_config:
+                                    logging.warning(f"Не знайдено конфігурацію для каналу {entity.title} (ID: {channel_id})")
+                                    continue
+                                
+                                # Перевірка фільтрів за ключовими словами
+                                keywords = current_channel_config.get('keywords', [])
+                                should_forward = not keywords or filter_message(message_text, keywords)
+                                
+                                if should_forward:
+                                    try:
+                                        # Отримання цільового каналу з загальної конфігурації
                                         target_channel_id = self.config.get('target_channel_id')
+                                        
                                         if target_channel_id:
-                                            await self.client.send_message(
-                                                PeerChannel(int(target_channel_id)), 
-                                                message_text
-                                            )
-                                            logging.info(f"Переслано повідомлення в канал {target_channel_id}")
+                                            # Додаємо підпис з назвою каналу-джерела
+                                            channel_signature = f"**Канал: {entity.title}**\n\n"
+                                            full_message = channel_signature + message_text
+                                            
+                                            # Використовуємо ID безпосередньо
+                                            await self.client.send_message(PeerChannel(int(target_channel_id)), full_message)
+                                            logging.info(f"[Активне опитування] Переслано повідомлення з {entity.title} (ID: {channel_id}) до {target_channel_id}")
                                         else:
-                                            logging.error("Не вказано ID цільового каналу")
-                                    else:
-                                        logging.info(f"Повідомлення не відповідає фільтрам: {keywords}")
-                                
-                                # Оновлюємо останній ID
-                                last_message_ids[channel_id] = new_messages[-1].id
+                                            logging.error("Не вказано ID цільового каналу в конфігурації")
+                                    except Exception as e:
+                                        logging.error(f"Помилка пересилання: {e}")
+                                else:
+                                    logging.info(f"[Активне опитування] Повідомлення з {entity.title} (ID: {channel_id}) не відповідає фільтрам")
                             
                         except FloodWaitError as e:
                             logging.warning(f"Потрібно почекати {e.seconds} секунд перед наступним запитом")
-                            # Збільшуємо інтервал опитування, щоб уникнути подальших блокувань
-                            poll_interval = max(poll_interval, e.seconds + 5)
-                            logging.info(f"Інтервал моніторингу збільшено до {poll_interval} секунд")
                             await asyncio.sleep(e.seconds)
                         except Exception as e:
-                            logging.error(f"Помилка при моніторингу каналу {channel_id}: {e}")
-                    
-                    # Очищаємо старі канали з словника останніх повідомлень
-                    old_channels = set(last_message_ids.keys()) - set(channel_ids)
-                    for old_channel in old_channels:
-                        del last_message_ids[old_channel]
+                            logging.error(f"Помилка при опитуванні каналу {channel_id}: {e}")
                     
                 except Exception as e:
-                    logging.error(f"Помилка в циклі моніторингу: {e}", exc_info=True)
+                    logging.error(f"Помилка в циклі активного опитування: {e}", exc_info=True)
                 
-                # Чекаємо перед наступною перевіркою
+                # Чекаємо перед наступним опитуванням
                 await asyncio.sleep(poll_interval)
                 
         except asyncio.CancelledError:
-            logging.info("Завдання моніторингу скасовано")
-            raise
+            logging.info("Завдання активного опитування скасовано")
         except Exception as e:
-            logging.error(f"Критична помилка в циклі моніторингу: {e}", exc_info=True)
-            # Перезапускаємо цикл моніторингу
-            if self.running:
-                logging.info("Перезапуск циклу моніторингу через 30 секунд...")
-                await asyncio.sleep(30)
-                return await self.manual_polling()
+            logging.error(f"Критична помилка в циклі активного опитування: {e}", exc_info=True)
+            # Перезапускаємо цикл опитування
+            logging.info("Перезапуск циклу активного опитування через 10 секунд...")
+            await asyncio.sleep(10)
+            return await self.active_polling()
 
 async def main():
     # Перевірка на одночасний запуск
