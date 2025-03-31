@@ -38,4 +38,11 @@ channels:
 
   - channel_id: 2160678345 # KostyaKogan
     keywords:
-      - "Открыл"
+      - "long"
+      - "short"
+
+  - channel_id: 1800752530 # Скальпинг с Андреем Павловым
+    keywords:
+      - "открываю"
+      - "актив"
+

@@ -294,12 +294,8 @@ class TelegramMonitor:
                         target_channel_id = self.config.get('target_channel_id')
                         
                         if target_channel_id:
-                            # Додаємо підпис з назвою каналу-джерела
-                            channel_signature = f"**Канал: {event.chat.title}**\n\n"
-                            full_message = channel_signature + message_text
-                            
                             # Використовуємо ID безпосередньо
-                            await self.client.send_message(PeerChannel(int(target_channel_id)), full_message)
+                            await self.client.forward_messages(PeerChannel(int(target_channel_id)), event.message)
                             logging.info(f"Переслано повідомлення з {event.chat.title} (ID: {event.chat.id}) до {target_channel_id}")
                         else:
                             logging.error("Не вказано ID цільового каналу в конфігурації")
@@ -442,12 +438,8 @@ class TelegramMonitor:
                                         target_channel_id = self.config.get('target_channel_id')
                                         
                                         if target_channel_id:
-                                            # Додаємо підпис з назвою каналу-джерела
-                                            channel_signature = f"**Канал: {entity.title}**\n\n"
-                                            full_message = channel_signature + message_text
-                                            
                                             # Використовуємо ID безпосередньо
-                                            await self.client.send_message(PeerChannel(int(target_channel_id)), full_message)
+                                            await self.client.forward_messages(PeerChannel(int(target_channel_id)), message)
                                             logging.info(f"[Активне опитування] Переслано повідомлення з {entity.title} (ID: {channel_id}) до {target_channel_id}")
                                         else:
                                             logging.error("Не вказано ID цільового каналу в конфігурації")
